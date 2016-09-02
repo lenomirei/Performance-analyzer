@@ -6,6 +6,14 @@
 #include <string>
 #include <cassert>
 #include <stdarg.h>
+#include <mutex>
+#include <algorithm>
+#ifdef _WIN32
+#include <windows.h>
+#include <thread>
+#else
+#include <thread.h>
+#endif
 using namespace std;
 
 
@@ -79,26 +87,107 @@ struct PPNode_Hash
 struct PPSection
 {
 	typedef long long LongType;
-	LongType _beginTime;
-	LongType _costTime;//花费时间
-	LongType _callCount;//调用次数
+	LongType _totalBeginTime;
+	LongType _totalCostTime;//花费时间
+	LongType _totalCallCount;//调用次数
+	LongType _totalRefCount;//引用计数，处理递归使用
+	map<int, LongType> _beginTimeMap;
+	map<int, LongType> _costTimeMap;
+	map<int, LongType> _callCountMap;
+	map<int, LongType> _refCountMap;
+	mutex mx;
+	//<id,统计信息>
 	PPSection()
-		:_costTime(0)
-		,_beginTime(0)
-		,_callCount(0)
+		:_totalBeginTime(0)
+		, _totalCostTime(0)
+		, _totalCallCount(0)
+		, _totalRefCount(0)
 	{}
-	void Begin()
+	void Begin(int _id)
 	{
-		_beginTime = clock();
+		lock_guard<mutex> lock(mx);
+		if (_id != -1)
+		{
+			if (_refCountMap[_id]++ == 0)
+			{
+				_beginTimeMap[_id] = clock();
+			}
+		}
+		else
+		{
+			if (_totalRefCount++ == 0)
+			{
+				_totalBeginTime = clock();
+			}
+		}
 	}
-	void End()
+	void End(int _id)
 	{
-		_costTime += clock() - _beginTime;
-		++_callCount;
-		//cout << _costTime << endl;
+		lock_guard<mutex> lock(mx);
+		if (_id != -1)
+		{
+			if (--_refCountMap[_id] == 0)
+			{
+				_costTimeMap[_id] = clock() - _beginTimeMap[_id];
+			}
+			++_callCountMap[_id];
+		}
+		
+		else
+		{
+			if (--_totalRefCount == 0)
+			{
+				_totalCostTime = clock() - _totalBeginTime;
+			}
+			++_totalCallCount;
+		}
+		//分别统计线程的花费时间和总的花费时间
 	}
 };
+//////////////////////////////////////////////////////////////////////////////
+/////配置管理
+enum ConfigOptions
+{
+	NONE = 0,
+	PERFORMANCE_PROFILER = 1,//开始剖析的选项
+	SAVE_TO_CONSOLE = 2,
+	SAVE_TO_FILE = 4,
+	SORT_BY_COSTTIME = 8,
+	SORT_BY_CALLCOUNT = 16,
+};
+class ConfigManager :public Singleton<ConfigManager>
+{
+	friend class Singleton<ConfigManager>;
+public:
+	void SetOptions(int options)
+	{
+		_options = options;
+	}
+	void AddOptions(int options)
+	{
+		_options |= options;
+	}
+	void DeleteOptions(int options)
+	{
+		_options &= (~options);
+	}
+    int	GetOptions()
+	{
+		return _options;
+	}
+protected:
+	ConfigManager()
+		:_options(NONE)
+	{}
+	ConfigManager(ConfigManager &)
+	{}
+	ConfigManager &operator=(ConfigManager &)
+	{}
+protected:
+	int _options;
+};
 
+//////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////
 class SaveAdapter
 {
@@ -136,7 +225,8 @@ public:
 		va_end(va);
 	}
 protected:
-	FileSaveAdapter(FileSaveAdapter &);
+	FileSaveAdapter(FileSaveAdapter &)
+	{}
 private:
 	FILE *_fout;
 };
@@ -148,11 +238,11 @@ private:
 
 class PerformanceProfiler:public Singleton<PerformanceProfiler>
 {
-	
+	typedef long long LongType;
 	typedef unordered_map<PPNode, PPSection*, PPNode_Hash> PP_MAP;
 public:
 	
-	PPSection* CreateSeciton(const char * filename, const char* function, size_t line, const char *desc)
+	PPSection* CreateSection(const char * filename, const char* function, size_t line, const char *desc)
 	{
 		PPNode node(filename, function, line, desc);
 		PPSection *section = NULL;
@@ -163,6 +253,7 @@ public:
 		}
 		else
 		{
+			lock_guard<mutex> lock(mx);
 			section = new PPSection;
 			_ppMap.insert(pair<PPNode, PPSection*>(node, section));
 		}
@@ -177,28 +268,82 @@ public:
 		}
 	};
 
+	
+
 	void Output()
 	{
-		ConsoleSaveAdapter csa;
-		_Output(csa);
-		FileSaveAdapter fsa("PerFormanceProfilerRepot.txt");
-		_Output(csa);
-
+		int options = ConfigManager::GetInstance()->GetOptions();
+		if (options & SAVE_TO_FILE)
+		{
+			FileSaveAdapter fsa("PerFormanceProfilerRepot.txt");
+			_Output(fsa);
+		}
+		if (options & SAVE_TO_CONSOLE)
+		{
+			ConsoleSaveAdapter csa;
+			_Output(csa);
+		}
 	}
 protected:
-	
+	mutex mx;
 	void _Output(SaveAdapter &sa)
 	{
+		vector<PP_MAP::iterator> vInfos;
 		int num = 1;
 		PP_MAP::iterator ppit = _ppMap.begin();
 		while (ppit != _ppMap.end())
 		{
 			const PPNode &node = ppit->first;
 			PPSection *section = ppit->second;
-			sa.Save("No.%d , Desc :%s",num++,node._desc.c_str());
-			sa.Save("Filename : %s , Line : %d , Function : %s", num++, node._filename.c_str(), node._line, node._function.c_str());
-			sa.Save("CostTime : %.2f  , CallCount : %lld ",((double)section->_costTime)/1000,section->_callCount);
+
+			map<int, LongType>::iterator timeit;
+			timeit = section->_costTimeMap.begin();
+
+
+			/*sa.Save("No.%d , Desc :%s\n", num++, node._desc.c_str());
+			sa.Save("Filename : %s , Line : %d , Function : %s\n", node._filename.c_str(), node._line, node._function.c_str());*/
+
+			while (timeit != section->_costTimeMap.end())
+			{
+				int id = timeit->first;
+				section->_totalCostTime += timeit->second;
+				section->_totalCallCount += section->_callCountMap[timeit->first];
+				/*sa.Save("Thread id : %d , costTime : %.2f , CallCount : %lld\n",id,(double)timeit->second/1000,section->_callCountMap[id]);*/
+				++timeit;
+			}
+
+			
+			/*sa.Save("CostTime : %.2f  , CallCount : %lld , averageTime : %.2f\n",((double)section->_totalCostTime)/1000,section->_totalCallCount, ((double)section->_totalCostTime)/ (1000*section->_totalCallCount));*/
+			vInfos.push_back(ppit);
 			++ppit;
+
+		}
+		struct SortByCostTime
+		{
+			bool operator()(PP_MAP::iterator l, PP_MAP::iterator r) const
+			{
+				return (l->second->_totalCostTime) < (r->second->_totalCostTime);
+			}
+		};
+		sort(vInfos.begin(), vInfos.end(), SortByCostTime());
+		for (int i = 0; i < vInfos.size(); ++i)
+		{
+			ppit = vInfos[i];
+			const PPNode &node = ppit->first;
+			PPSection *section = ppit->second;
+			sa.Save("No.%d , Desc :%s\n", num++, node._desc.c_str());
+			sa.Save("Filename : %s , Line : %d , Function : %s\n", node._filename.c_str(), node._line, node._function.c_str());
+			map<int, LongType>::iterator timeit;
+			timeit = section->_costTimeMap.begin();
+			while (timeit != section->_costTimeMap.end())
+			{
+				int id = timeit->first;
+				section->_totalCostTime += timeit->second;
+				section->_totalCallCount += section->_callCountMap[timeit->first];
+				/*sa.Save("Thread id : %d , costTime : %.2f , CallCount : %lld\n",id,(double)timeit->second/1000,section->_callCountMap[id]);*/
+				++timeit;
+			}
+			sa.Save("CostTime : %.2f  , CallCount : %lld , averageTime : %.2f\n",((double)section->_totalCostTime)/1000,section->_totalCallCount, ((double)section->_totalCostTime)/ (1000*section->_totalCallCount));
 		}
 	}
 	friend class Singleton<PerformanceProfiler>;
@@ -211,11 +356,59 @@ protected:
 	PP_MAP _ppMap;
 	
 };
+static  PerformanceProfiler::Report report;
 
-#define PERFORMANCE_PROFILER_EE_BEGIN(sign,desc)\
-PPSection *ps##sign=PerformanceProfiler::GetInstance()->CreateSeciton\
-(__FILE__,__FUNCTION__,__LINE__,desc);\
-ps##sign->Begin();
+static int _GetThreadId()
+{
+#ifdef _WIN32
+	return GetCurrentThreadId();
+#else
+	return pthread_self();
+#endif
+}
 
-#define PERFORMANCE_PROFILER_EE_END(sign)\
-ps##sign->End();
+
+#define PERFORMANCE_PROFILER_EE_ST_BEGIN(sign,desc)\
+PPSection *ps##sign=NULL;\
+if(ConfigManager::GetInstance()->GetOptions() & PERFORMANCE_PROFILER)\
+{\
+	ps##sign=PerformanceProfiler::GetInstance()->CreateSection\
+	(__FILE__,__FUNCTION__,__LINE__,desc);\
+	ps##sign->Begin(-1);\
+}\
+
+
+#define PERFORMANCE_PROFILER_EE_ST_END(sign)\
+if(ps##sign)\
+ps##sign->End(-1);
+
+
+#define PERFORMANCE_PROFILER_EE_MT_BEGIN(sign,desc)\
+PPSection *ps##sign=NULL;\
+if(ConfigManager::GetInstance()->GetOptions() & PERFORMANCE_PROFILER)\
+{\
+	ps##sign=PerformanceProfiler::GetInstance()->CreateSection\
+	(__FILE__,__FUNCTION__,__LINE__,desc);\
+	ps##sign->Begin(_GetThreadId());\
+}\
+
+
+#define PERFORMANCE_PROFILER_EE_MT_END(sign)\
+if(ps##sign)\
+ps##sign->End(_GetThreadId());
+
+
+//设置开启选项的宏函数，如果不设置开始剖析就无法打出结果
+#define SET_CONFIG_OPTIONS(option)\
+ConfigManager::GetInstance()->SetOptions(option)
+
+
+
+//暂时不会用的宏函数
+//#define PERFORMANCE_PROFILER_EE_BEGIN(sign,desc)\
+//PPSection *ps##sign=PerformanceProfiler::GetInstance()->CreateSection\
+//(__FILE__,__FUNCTION__,__LINE__,desc);\
+//ps##sign->Begin(_GetThreadId());
+//
+//#define PERFORMANCE_PROFILER_EE_END(sign)\
+//ps##sign->End(_GetThreadId());
