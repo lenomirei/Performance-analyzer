@@ -268,8 +268,6 @@ public:
 		}
 	};
 
-	
-
 	void Output()
 	{
 		int options = ConfigManager::GetInstance()->GetOptions();
